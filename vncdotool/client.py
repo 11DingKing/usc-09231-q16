@@ -1,6 +1,6 @@
-""" . "说明"
+"""
 Twisted based VNC client protocol and factory.
-""" . "说明"
+"""
 # (c) 2010-2024 Marc Sibson
 #
 # MIT License
@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import logging
 import socket
+import time
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from struct import pack
@@ -58,24 +60,24 @@ class VNCDoException(Exception):
 
 
 class AuthenticationError(VNCDoException):
-    """ . "说明"VNC Server requires Authentication""" . "说明"
+    """VNC Server requires Authentication"""
 
 
 class ProtocolError(VNCDoException):
-    """ . "说明"VNC Server sent something we cannot handle""" . "说明"
+    """VNC Server sent something we cannot handle"""
 
 
 class RegionError(VNCDoException):
-    """ . "说明"A region to compare or capture is not on the screen""" . "说明"
+    """A region to compare or capture is not on the screen"""
 
 
 class _StableWatch:
-    """ . "说明"Bookkeeping for one :meth:`VNCDoToolClient.stableScreen` call.
+    """Bookkeeping for one :meth:`VNCDoToolClient.stableScreen` call.
 
     Waits for a trailing window of ``seconds`` in which no framebuffer update
     moved the screen further than ``fuzz`` from the frame before it.  See
     ``specs/screen-stability.md``.
-    """ . "说明"
+    """
 
     def __init__(
         self,
@@ -134,10 +136,10 @@ class _StableWatch:
 
 
 class _FullScreenReceived:
-    """ . "说明"RFC 6143 section 7.5.3 has the server answer a non-incremental
+    """RFC 6143 section 7.5.3 has the server answer a non-incremental
     FramebufferUpdateRequest with the entire requested area, across as many
     FramebufferUpdate messages as it likes.
-    """ . "说明"
+    """
 
     MAX_RETRIES = 1
 
@@ -148,16 +150,16 @@ class _FullScreenReceived:
 
     @classmethod
     def awaiting(cls, width: int, height: int) -> "_FullScreenReceived":
-        """ . "说明"For a non-incremental refresh, which is promised the whole area.""" . "说明"
+        """For a non-incremental refresh, which is promised the whole area."""
         return cls(width, height)
 
     @classmethod
     def satisfied(cls) -> "_FullScreenReceived":
-        """ . "说明"For a refresh promised no area: an incremental one, or none at all.""" . "说明"
+        """For a refresh promised no area: an incremental one, or none at all."""
         return cls(0, 0)
 
     def retry(self) -> bool:
-        """ . "说明"Whether the server is worth asking again, counting this attempt.""" . "说明"
+        """Whether the server is worth asking again, counting this attempt."""
         if self.pending and not self.painted:
             return True
         if self.retries >= self.MAX_RETRIES:
@@ -176,7 +178,7 @@ class _FullScreenReceived:
 
     @property
     def pending(self) -> bool:
-        """ . "说明"Whether a non-incremental refresh is still riding on this.""" . "说明"
+        """Whether a non-incremental refresh is still riding on this."""
         return self.remaining.size != (0, 0)
 
     def __str__(self) -> str:
@@ -187,6 +189,226 @@ class _FullScreenReceived:
             f"unpainted after {self.retries + 1} full-screen update "
             f"requests; capturing it as black"
         )
+
+
+@dataclass
+class _PendingMove:
+    """One local PointerEvent whose echo has not come back yet.
+
+    ``sequence`` is the client-local order of the send; ``sent_at`` is the
+    monotonic time the event left the client, bounding how long an echo may
+    take to return.
+    """
+
+    sequence: int
+    x: int
+    y: int
+    sent_at: float
+
+
+class _PointerGuard:
+    """Decide whether an incoming PointerPos rectangle is current.
+
+    After the client sends a pointer move, PointerPos updates that were
+    already in flight -- echoes of the client's own earlier positions or a
+    desktop position sampled before the move -- can arrive *after* the move
+    completed and drag the cursor back. Three pieces of evidence decide if
+    an arriving event is stale:
+
+    * the **receive water mark**: events stamped at or before the last
+      applied timestamp are out of order (or share a timestamp), except for
+      the confirmation of the newest local move;
+    * **unacknowledged local moves**, matched by position: an update at a
+      pending position confirms that move, while an update at an older
+      server position while a newer move is pending is a lagging state;
+    * the **echo graveyard**: once an external move takes over, echoes of
+      positions the client asked for earlier are dropped for the rest of
+      that ambiguity window, not merely once; the graveyard is replaced by
+      whichever positions each newly accepted state actually displaced.
+
+    Everything resets when the connection is re-established, so an epoch
+    change cannot be mistaken for a re-ordered event.
+    """
+
+    # How long a local move waits for its echo before it is treated as
+    # acknowledged on its own; servers that never send PointerPos must not
+    # leave pending moves to suppress real motion forever.
+    ECHO_TIMEOUT = 30.0
+    # How many recent server-reported positions count as "the position the
+    # desktop was at before a pending local move".
+    RECENT_SERVER_POSITIONS = 4
+    # How long a consumed echo stays in the graveyard.
+    GRAVEYARD_TTL = 30.0
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self.reset()
+
+    def reset(self) -> None:
+        """Forget every fence on a (re)connection; timestamps from a
+        previous transport must never be compared against new ones."""
+        self._next_sequence = 0
+        self._pending: list[_PendingMove] = []
+        self._recent_server: list[tuple[int, int]] = []
+        self._graveyard: dict[tuple[int, int], float] = {}
+        # Monotonic water mark of applied events; ``None`` until the first
+        # event of the connection is accepted.
+        self._applied_at: float | None = None
+
+    # -- outgoing side ---------------------------------------------------
+
+    def local_move(self, x: int, y: int) -> int:
+        """Record a PointerEvent the client is about to send and
+        return its sequence number."""
+        now = self._clock()
+        self._expire(now)
+        self._next_sequence += 1
+        self._pending.append(_PendingMove(self._next_sequence, x, y, now))
+        return self._next_sequence
+
+    # -- incoming side ---------------------------------------------------
+
+    def is_current(self, x: int, y: int, timestamp: float | None = None) -> bool:
+        """Whether a PointerPos(x, y) arriving now may set the
+        pointer. A rejected event is stale -- an old echo or a position
+        sampled before a newer local move.
+
+        ``timestamp`` is the event's ordering time, assigned at reception by
+        default; callers processing a re-ordered queue may pass the time the
+        event was first stamped with.
+        """
+        now = self._clock()
+        self._expire(now)
+        if timestamp is None:
+            timestamp = now
+
+        position = (x, y)
+        newest = self._pending[-1] if self._pending else None
+
+        # 1. A position the newest pending move asked for confirms it. This
+        #    is the normal round trip and wins even over an equal receive
+        #    timestamp, since the confirmation is the event the client was
+        #    waiting for.
+        if newest is not None and position == (newest.x, newest.y):
+            self._confirm(newest, now, timestamp)
+            return True
+
+        # 2. An older pending position, while a *newer* move is still
+        #    unacknowledged, is that older move's echo arriving late. It is
+        #    simply rejected: whatever settles the newest move (an echo or an
+        #    external change) buries the older one at the same time.
+        if newest is not None and any(
+            position == (move.x, move.y) for move in self._pending[:-1]
+        ):
+            return False
+
+        # 3. An echo of a move or a server position already superseded. The
+        #    graveyard lasts for the whole ambiguity window, so a server
+        #    retransmitting the stale position two or more times still cannot
+        #    win once.
+        if position in self._graveyard:
+            return False
+
+        if newest is not None:
+            # 4. The desktop repeating one of its recent positions while a
+            #    local move is in flight is a state sampled before the move
+            #    reached the server.
+            if position in self._recent_server:
+                return False
+            # 5. A genuinely new position while a move is pending: someone
+            #    else moved the pointer. The pending moves will not confirm
+            #    now; bury them, and the positions they displaced, so their
+            #    late echoes cannot win.
+            self._adopt_external(position, now, timestamp)
+            return True
+
+        # 6. Receive water mark against re-ordering and equal timestamps.
+        if self._applied_at is not None and timestamp <= self._applied_at:
+            # Earlier: out of order. Equal: a replay of the same instant;
+            # the first writer already won (case 1 is the only override).
+            return False
+
+        # A genuinely different position is a later server message and a
+        # barrier: over an ordered transport nothing buried behind it can
+        # still be delivered. But a *repeat* of the current position may be
+        # a retransmit queued ahead of a buried echo, so it must not clear
+        # the graveyard.
+        if position != self._current_position():
+            self._graveyard.clear()
+        self._remember_server_position(position)
+        self._applied_at = timestamp
+        return True
+
+    def _current_position(self) -> tuple[int, int] | None:
+        if self._pending:
+            pending = self._pending[-1]
+            return (pending.x, pending.y)
+        if self._recent_server:
+            return self._recent_server[-1]
+        return None
+
+    # -- bookkeeping -----------------------------------------------------
+
+    def _confirm(self, move: _PendingMove, now: float, timestamp: float) -> None:
+        # The confirmed move settles it and every older pending one; an echo
+        # of an older move the server coalesced away may still arrive late.
+        graveyard = {
+            (done.x, done.y): now
+            for done in self._pending
+            if done.sequence < move.sequence
+        }
+        self._pending = [
+            pending
+            for pending in self._pending
+            if pending.sequence > move.sequence
+        ]
+        # Positions the pointer came *from* per our own instruction may be
+        # reported by an update already queued behind this echo; they stay
+        # stale until the next accepted state displaces them. The graveyard
+        # is replaced rather than extended: RFB runs over an ordered
+        # transport, so once the echo of this move is in hand, no position
+        # superseded before it can be delivered afterwards.
+        for position in self._recent_server:
+            if position != (move.x, move.y):
+                graveyard[position] = now
+        self._graveyard = graveyard
+        self._recent_server = [(move.x, move.y)]
+        self._applied_at = timestamp
+
+    def _adopt_external(
+        self, position: tuple[int, int], now: float, timestamp: float
+    ) -> None:
+        # Someone else moved the pointer: our pending echoes and every
+        # position they, or the server, displaced are stale for the window
+        # that opens here.
+        graveyard = {(move.x, move.y): now for move in self._pending}
+        for old_position in self._recent_server:
+            if old_position != position:
+                graveyard[old_position] = now
+        self._graveyard = graveyard
+        self._pending.clear()
+        self._recent_server = [position]
+        self._applied_at = timestamp
+
+    def _remember_server_position(self, position: tuple[int, int]) -> None:
+        if position in self._recent_server:
+            self._recent_server.remove(position)
+        self._recent_server.append(position)
+        del self._recent_server[: -self.RECENT_SERVER_POSITIONS]
+
+    def _expire(self, now: float) -> None:
+        # Pending moves past the echo budget are self-acknowledged: drop
+        # them and bury their positions, so an echo that lands after the
+        # budget is still treated as stale until TTL clears it.
+        stale = [
+            move for move in self._pending if now - move.sent_at > self.ECHO_TIMEOUT
+        ]
+        for move in stale:
+            self._pending.remove(move)
+            self._graveyard[(move.x, move.y)] = now
+        for position, buried_at in list(self._graveyard.items()):
+            if now - buried_at > self.GRAVEYARD_TTL:
+                del self._graveyard[position]
 
 
 class VNCDoToolClient(rfb.RFBClient):
@@ -213,6 +435,7 @@ class VNCDoToolClient(rfb.RFBClient):
     def __init__(self) -> None:
         super().__init__()
         self._fullscreen = _FullScreenReceived.satisfied()
+        self._pointer_guard = _PointerGuard()
 
     def connectionMade(self) -> None:
         super().connectionMade()
@@ -242,10 +465,10 @@ class VNCDoToolClient(rfb.RFBClient):
         return d
 
     def keyPress(self: TClient, key: str) -> TClient:
-        """ . "说明"Send a key press to the server
+        """Send a key press to the server
 
         :param key: either [a-z] or a from :const:`KEYMAP`.
-        """ . "说明"
+        """
         keys = self._decodeKey(key)
         log.debug("keyPress %s", keys)
         for k in keys:
@@ -272,10 +495,10 @@ class VNCDoToolClient(rfb.RFBClient):
         return self
 
     def mousePress(self: TClient, button: int) -> TClient:
-        """ . "说明"Send a mouse click at the last set position
+        """Send a mouse click at the last set position
 
         :param button: [1-n]
-        """ . "说明"
+        """
         log.debug("mousePress %s", button)
         self.mouseDown(button)
         self.mouseUp(button)
@@ -283,10 +506,10 @@ class VNCDoToolClient(rfb.RFBClient):
         return self
 
     def mouseDown(self: TClient, button: int) -> TClient:
-        """ . "说明"Send a mouse button down at the last set position
+        """Send a mouse button down at the last set position
 
         :param button: [1-n]
-        """ . "说明"
+        """
         log.debug("mouseDown %s", button)
         self.buttons |= 1 << (button - 1)
         self.pointerEvent(self.x, self.y, buttonmask=self.buttons)
@@ -294,10 +517,10 @@ class VNCDoToolClient(rfb.RFBClient):
         return self
 
     def mouseUp(self: TClient, button: int) -> TClient:
-        """ . "说明"Send mouse button released at the last set position
+        """Send mouse button released at the last set position
 
         :param button: [1-n]
-        """ . "说明"
+        """
         log.debug("mouseUp %s", button)
         self.buttons &= ~(1 << (button - 1))
         self.pointerEvent(self.x, self.y, buttonmask=self.buttons)
@@ -307,21 +530,21 @@ class VNCDoToolClient(rfb.RFBClient):
     def captureScreen(
         self, fp: TFile, incremental: bool = False, format: str | None = None
     ) -> Deferred:
-        """ . "说明"Capture and save the current VNC screen display to a file.
+        """Capture and save the current VNC screen display to a file.
 
         :param incremental: if True, only wait for regions that have changed
             since the last capture, rather than the whole screen.
         :param format: a Pillow image format; see Pillow's list of `image
             file formats <https://pillow.readthedocs.io/en/stable/handbook/image-file-formats.html>`_.
             Defaults to whatever Pillow infers from ``fp``'s file name.
-        """ . "说明"
+        """
         log.debug("captureScreen %s", fp)
         return self._capture(fp, incremental, format=format)
 
     def captureRegion(
         self, fp: TFile, x: int, y: int, w: int, h: int, incremental: bool = False
     ) -> Deferred:
-        """ . "说明"Save a region of the current display to filename""" . "说明"
+        """Save a region of the current display to filename"""
         log.debug("captureRegion %s", fp)
         self._requireOnScreen((x, y, x + w, y + h))
         return self._capture(fp, incremental, (x, y, x + w, y + h))
@@ -350,28 +573,28 @@ class VNCDoToolClient(rfb.RFBClient):
         return d
 
     def _requireOnScreen(self, box: tuple[int, int, int, int]) -> None:
-        """ . "说明"Raise unless a region to crop lies on the screen.
+        """Raise unless a region to crop lies on the screen.
 
         ``Image.crop`` pads whatever falls outside the image with black
         rather than failing, so an off-screen region compares against black
         and captures it.
-        """ . "说明"
+        """
         width, height = self.screen.size if self.screen else (self.width, self.height)
         if box[0] < 0 or box[1] < 0 or box[2] > width or box[3] > height:
             raise RegionError(f"region {box} is not inside the {width}x{height} screen")
 
     def renderScreen(self) -> Image.Image:
-        """ . "说明"The display as a capture or a comparison sees it.
+        """The display as a capture or a comparison sees it.
 
         Returns a new image of the framebuffer as it already stands, with the
         ``--cursor local`` pointer drawn on it. Nothing is asked of the
         server; call :meth:`refreshScreen` first for anything newer than the
         last update to arrive.
-        """ . "说明"
+        """
         return self._render()
 
     def renderRegion(self, x: int, y: int, w: int, h: int) -> Image.Image:
-        """ . "说明"A region of the display, as :meth:`renderScreen` gives the whole.""" . "说明"
+        """A region of the display, as :meth:`renderScreen` gives the whole."""
         box = (x, y, x + w, y + h)
         self._requireOnScreen(box)
         return self._render(box)
@@ -408,7 +631,7 @@ class VNCDoToolClient(rfb.RFBClient):
     def expectScreen(
         self, filename: str, fuzz: int | None = None, blur: int | None = None
     ) -> Deferred:
-        """ . "说明"Wait until the display matches a target image
+        """Wait until the display matches a target image
 
         :param filename: an image file to read and compare against.
         :param fuzz: how far any one pixel may sit from the target, a whole
@@ -417,14 +640,14 @@ class VNCDoToolClient(rfb.RFBClient):
             what the negotiated pixel format cannot express.
         :param blur: blur both screens by this radius before comparing, which
             is what carries a match through a lossy encoding.
-        """ . "说明"
+        """
         log.debug("expectScreen %s", filename)
         return self._expectFramebuffer(filename, 0, 0, fuzz, blur)
 
     def expectRegion(
         self, filename: str, x: int, y: int, fuzz: int | None = None, blur: int | None = None
     ) -> Deferred:
-        """ . "说明"Wait until a portion of the screen matches the target image
+        """Wait until a portion of the screen matches the target image
 
         The region compared is defined by the box
         (x, y), (x + image.width, y + image.height)
@@ -435,14 +658,14 @@ class VNCDoToolClient(rfb.RFBClient):
             what the negotiated pixel format cannot express.
         :param blur: blur both screens by this radius before comparing, which
             is what carries a match through a lossy encoding.
-        """ . "说明"
+        """
         log.debug("expectRegion %s (%s, %s)", filename, x, y)
         return self._expectFramebuffer(filename, x, y, fuzz, blur)
 
     def stableScreen(
         self, seconds: float, fuzz: int | None = None, blur: int | None = None
     ) -> Deferred:
-        """ . "说明"Wait until the display stops changing
+        """Wait until the display stops changing
 
         :param seconds: length of the trailing window during which the screen
             must not have changed.  The call takes at least this long, and
@@ -451,7 +674,7 @@ class VNCDoToolClient(rfb.RFBClient):
             previous frame and still count as unchanged, on the scale
             :meth:`expectScreen` takes, and with the same default.
         :param blur: blur both frames by this radius before comparing.
-        """ . "说明"
+        """
         log.debug("stableScreen %f", seconds)
         return _StableWatch(
             self, seconds, self._fuzz(fuzz), self._blur(blur), self.renderScreen
@@ -467,7 +690,7 @@ class VNCDoToolClient(rfb.RFBClient):
         fuzz: int | None = None,
         blur: int | None = None,
     ) -> Deferred:
-        """ . "说明"Wait until a region of the display stops changing""" . "说明"
+        """Wait until a region of the display stops changing"""
         log.debug("stableRegion %f (%s, %s)", seconds, x, y)
         self._requireOnScreen((x, y, x + w, y + h))
         return _StableWatch(
@@ -490,9 +713,9 @@ class VNCDoToolClient(rfb.RFBClient):
         )
 
     def _fuzz(self, fuzz: int | None) -> int:
-        """ . "说明"A server sending 5-bit red cannot reproduce most 8-bit values, so an
+        """A server sending 5-bit red cannot reproduce most 8-bit values, so an
         exact comparison never comes true however long it is polled for.
-        """ . "说明"
+        """
         if fuzz is not None:
             return fuzz
         if self.fuzz is not None:
@@ -522,15 +745,22 @@ class VNCDoToolClient(rfb.RFBClient):
         return self.deferred
 
     def mouseMove(self: TClient, x: int, y: int) -> TClient:
-        """ . "说明"Move the mouse pointer to position (x, y)""" . "说明"
+        """Move the mouse pointer to position (x, y)
+
+        The position is applied locally at once and recorded as an
+        unacknowledged move, so a PointerPos the network delivers late -- an
+        echo of an earlier position or a state sampled before this move --
+        cannot drag the pointer back.
+        """
         log.debug("mouseMove %d,%d", x, y)
         self.x, self.y = x, y
+        self._pointer_guard.local_move(x, y)
         self.pointerEvent(x, y, self.buttons)
         return self
 
     @inlineCallbacks
     def mouseDrag(self: TClient, x: int, y: int, step: int = 1) -> Iterator[Deferred]:
-        """ . "说明"Move the mouse point to position (x, y) in increments of step""" . "说明"
+        """Move the mouse point to position (x, y) in increments of step"""
         log.debug("mouseDrag %d,%d", x, y)
         ox, oy = self.x, self.y
         dx, dy = x - ox, y - oy
@@ -553,7 +783,7 @@ class VNCDoToolClient(rfb.RFBClient):
         return self._raw_mode
 
     def setImageMode(self) -> None:
-        """ . "说明"Check support for PixelFormats announced by server or select client supported alternative.""" . "说明"
+        """Check support for PixelFormats announced by server or select client supported alternative."""
         pixel_format = self.requested_pixel_format
         if pixel_format is None:
             try:
@@ -595,6 +825,9 @@ class VNCDoToolClient(rfb.RFBClient):
         self.factory.clientConnectionFailed(self, Failure(ProtocolError(reason)))
 
     def vncConnectionMade(self) -> None:
+        # New transport: timestamps and pending echoes from a previous
+        # connection must not fence events of this one.
+        self._pointer_guard.reset()
         self.setImageMode()
         encodings = list(self.requested_encodings or decoders.DEFAULT_ENCODINGS)
         # A server that paints the pointer into the framebuffer stops once a
@@ -705,7 +938,16 @@ class VNCDoToolClient(rfb.RFBClient):
         self.cfocus = x, y
 
     def updatePointerPos(self, x: int, y: int) -> None:
-        """ . "说明"The server moved the pointer to (x, y).""" . "说明"
+        """The server moved the pointer to (x, y).
+
+        The rectangle is only applied when :class:`_PointerGuard` judges it
+        current; a late echo of the client's own motion or a position
+        sampled before a move the script just made is discarded here so it
+        cannot overwrite the newer state.
+        """
+        if not self._pointer_guard.is_current(x, y):
+            log.debug("discarding stale PointerPos %d,%d", x, y)
+            return
         self.x, self.y = x, y
 
     def updateDesktopSize(self, width: int, height: int) -> None:
@@ -776,9 +1018,9 @@ DIALECTS: dict[str, type | None] = {
 
 
 def apply_dialect(factory: VNCDoToolFactory, name: str) -> None:
-    """ . "说明"The CLI and the library each bring their own client subclass, so a
+    """The CLI and the library each bring their own client subclass, so a
     dialect mixes into `factory.protocol` rather than replacing it.
-    """ . "说明"
+    """
     dialect = DIALECTS[name]
     if dialect is None:
         return
